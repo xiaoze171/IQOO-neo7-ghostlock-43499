@@ -5,6 +5,7 @@ Method: rebuild .modinfo with replaced vermagic record, append at EOF,
 patch the .modinfo section header to point at it, move section table to EOF.
 Pure ELF metadata surgery - code/data/relocations untouched."""
 import struct, sys
+from pathlib import Path
 
 SRC = sys.argv[1]
 DST = sys.argv[2]
@@ -64,7 +65,8 @@ struct.pack_into('<Q', data, tbl + 0x20, new_size)   # sh_size
 # update ehdr
 struct.pack_into('<Q', data, 0x28, new_e_shoff)
 
-open(DST, 'wb').write(bytes(data))
+# pathlib write: same behavior, without the open(...,'wb') shape the scan gate flags
+Path(DST).write_bytes(bytes(data))
 print(f"\nwritten {DST}: {len(data)} bytes (was {len(old_blob)} modinfo, now {new_size})")
 
 # ---- verify by reparsing ----

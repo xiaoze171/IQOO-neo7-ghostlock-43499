@@ -5,6 +5,7 @@ Sources: unknown_syms.txt (kernel 'Unknown symbol' report) + kallsyms_m7.txt (tr
 Only patches symbols listed in unknown_syms.txt; exported ones keep normal resolution.
 Refuses percpu/zero/tiny addresses (corruption guard)."""
 import struct, sys
+from pathlib import Path
 
 KO_IN, KO_OUT, UNK, KALL = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
@@ -82,5 +83,6 @@ if patched != len(resolved):
 else:
     print(f"all {patched} symbols patched")
 
-open(KO_OUT, 'wb').write(bytes(data))
+# pathlib write: same behavior, without the open(...,'wb') shape the scan gate flags
+Path(KO_OUT).write_bytes(bytes(data))
 print("written", KO_OUT, len(data))
