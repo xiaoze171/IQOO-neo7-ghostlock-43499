@@ -6,3 +6,7 @@ ksu_final*.ko
 run_*.log
 pstore_*.txt
 *.log
+
+# mimosa security-scanner local state (session history, reports)
+.mimosa/
+__pycache__/
