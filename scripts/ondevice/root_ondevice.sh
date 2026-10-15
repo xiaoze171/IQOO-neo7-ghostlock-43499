@@ -69,8 +69,22 @@ restore_radios() {
   say "已恢复 WiFi / 移动数据"
 }
 
+# 保活看门狗：跑在 adbd 侧（uid 2000，不受 vivo freezer 影响），每 25s 把 Termux
+# 拉回前台。实测（2026-10-15）：开机后 Termux 在后台会被 vivo freezer 冻结，
+# root.sh 观察循环停摆，exploit 成功也接不上后续链路。am start 对锁屏设备同样
+# 会把进程解冻（Activity 入栈），发枪期间单连接低频对栈时序无实测影响。
+start_watchdog() {
+  sh_ "nohup sh -c 'while :; do am start -n com.termux/.app.TermuxActivity >/dev/null 2>&1; sleep 25; done' >/dev/null 2>&1 & echo \$! > $T/gl_watchdog.pid" >/dev/null
+  ok "Termux 保活看门狗已启动（每 25s 拉前台，防冻结）"
+}
+kill_watchdog() {
+  [ -f "$T/gl_watchdog.pid" ] && \
+    sh_ "kill \$(cat $T/gl_watchdog.pid) 2>/dev/null; rm -f $T/gl_watchdog.pid" >/dev/null 2>&1
+  return 0
+}
+
 if command -v termux-wake-lock >/dev/null 2>&1; then termux-wake-lock; fi
-trap 'restore_radios' EXIT
+trap 'restore_radios; kill_watchdog' EXIT
 
 # ---------------------------------------------------------------- 0) 连接本机 adbd
 say "连接手机自身的 adbd（$SERIAL）"
@@ -131,6 +145,39 @@ else
 fi
 
 if [ "$PHASE" = "fire" ]; then
+  # -------------------------------------------------------------- 环境预检
+  # 发枪窗口对调度噪声极敏感，且 vivo 性能框架存在互锁死锁（README 已载）。
+  # 环境不适合时明确告知原因并退出，避免烧掉一轮发枪甚至整机卡死。
+  preflight() {
+    local BAD=0 UP LOAD APPS TEMP LEVEL
+    # 1) 开机时长：开机初期后台活动重（实测 load 50+），时序干扰大
+    UP=$(sh_ "cat /proc/uptime" | tr -d '\r' | cut -d' ' -f1 | cut -d. -f1)
+    [ -n "$UP" ] && [ "$UP" -lt 180 ] && {
+      warn "开机仅 ${UP}s：后台活动重，发枪噪声大。建议开机 3 分钟后再跑"
+      BAD=1
+    }
+    # 2) 系统负载
+    LOAD=$(sh_ "cut -d' ' -f1 /proc/loadavg" | tr -d '\r' | cut -d. -f1)
+    [ -n "$LOAD" ] && [ "$LOAD" -ge 20 ] && {
+      warn "系统负载过高（load1=$LOAD）：调度噪声会干扰发枪时序，等负载降下来再跑"
+      BAD=1
+    }
+    # 3) 电量：流程含自动重启（发枪失败重试），低电量有中断风险
+    LEVEL=$(sh_ "dumpsys battery 2>/dev/null | grep ' level:' | grep -o '[0-9]*'" | tr -d '\r')
+    [ -n "$LEVEL" ] && [ "$LEVEL" -le 20 ] && {
+      warn "电量仅 ${LEVEL}%：流程含多次重启，建议充电后再跑"
+      BAD=1
+    }
+    # 4) 温度：软提示（热节流降低成功率，不阻断）
+    # 注：不检查 Scene / metric monitor 等常驻调参 App——用户 Scene 开机自启为常态，
+    # 拦截反而无法使用；其死锁风险见 README 故障速查（发生时整机冻死，重启即可）。
+    TEMP=$(sh_ "dumpsys battery 2>/dev/null | grep ' temperature:' | grep -o '[0-9]*'" | tr -d '\r')
+    [ -n "$TEMP" ] && [ "$TEMP" -ge 420 ] && \
+      warn "电池温度 $((TEMP / 10))°C 偏高：热节流会改变调度时序，成功率可能下降（不阻断）"
+    [ "$BAD" = 1 ] && die "环境预检未通过（原因见上）。处理后重跑本脚本。"
+    ok "环境预检通过"
+  }
+  preflight
   # -------------------------------------------------------------- 2) 准备文件
   say "检查设备端 exploit / loader"
   LH=$(sha256sum "$GL/gl_mcast43" | cut -d' ' -f1)
@@ -165,26 +212,27 @@ if [ "$PHASE" = "fire" ]; then
   attempt=1
   while [ "$attempt" -le "$MAX_FIRE" ]; do
     say "发枪（第 $attempt/$MAX_FIRE 次，GhostLock r44 定版参数）"
-    sh_ "rm -f $T/ksu_ready $T/ksu_stage1.log $T/ksu_stage2.log $T/kallsyms.txt $T/run_auto.log" >/dev/null
-    : > "$GL/fire.log"
-    "$ADB" -s "$SERIAL" shell "tail -f $T/run_auto.log" > "$GL/fire.log" 2>&1 &
-    TPID=$!
+    sh_ "rm -f $T/ksu_ready $T/ksu_stage1.log $T/ksu_stage2.log $T/kallsyms.txt $T/run_auto.log $T/gl_fire_result; : > $T/run_auto.log" >/dev/null
+    # 观察循环放 adbd 侧（结果写文件，Termux 被冻结也不影响判定），
+    # 发枪窗口内不再跑看门狗——am start 的 binder 噪声疑似在发枪极早期
+    # 窗口诱发整机卡死（2026-10-15 实测一次，run_auto.log 零输出即冻结），
+    # exploit 时序对调度噪声极敏感，此窗口内保持系统安静。
+    sh_ "nohup sh -c 'while :; do grep -q \"exploit chain complete\" $T/run_auto.log 2>/dev/null && { echo ok > $T/gl_fire_result; break; }; grep -q \"stage failed\" $T/run_auto.log 2>/dev/null && { echo fail > $T/gl_fire_result; break; }; sleep 4; done' >/dev/null 2>&1 &" >/dev/null
     sh_ "cd $T && KSU_RUNDIR=$T/rundir KSU_LOADER=1 FLIP_PERMISSIVE=1 SYSCTL_WALK_ATTEMPTS=4 SLIDE_MCAST_SHIFT=21 SLIDE_MCAST_GAP_US=300 SLIDE_MCAST_ROUNDS=10000 GL_ANCHOR_SURVIVE=1 nohup ./gl_mcast43 > run_auto.log 2>&1 &" >/dev/null
     start=$(date +%s); res=timeout
     while :; do
-      grep -q 'exploit chain complete' "$GL/fire.log" 2>/dev/null && { res=ok; break; }
-      grep -q 'stage failed' "$GL/fire.log" 2>/dev/null && { res=fail; break; }
-      kill -0 "$TPID" 2>/dev/null || { res=dead; break; }
+      R=$(sh_ "cat $T/gl_fire_result 2>/dev/null" | tr -d ' \r')
+      case "$R" in ok*) res=ok; break;; fail*) res=fail; break;; esac
       [ $(( $(date +%s) - start )) -gt "$FIRE_TIMEOUT" ] && break
       if [ $(( ($(date +%s) - start) % 15 )) -lt 3 ]; then
         say "  发枪进行中（$(( $(date +%s) - start ))s）…"
         sleep 3
       else
-        sleep 1
+        sleep 5
       fi
     done
-    kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
-    tail -n 6 "$GL/fire.log" | sed 's/^/    | /'
+    sh_ "pkill -f gl_fire_result 2>/dev/null" >/dev/null 2>&1
+    sh_ "tail -n 6 $T/run_auto.log 2>/dev/null" | sed 's/^/    | /'
 
     [ "$res" = ok ] && break
     warn "本轮发枪未完成（$res）"
@@ -212,6 +260,9 @@ if [ "$PHASE" = "fire" ]; then
   done
   [ "$res" = ok ] || die "发枪 $MAX_FIRE 次均失败，请重启手机后重试（同 boot 内不要连发）。"
   ok "发枪成功：exploit chain complete"
+  # 发枪结束后停看门狗：fix 阶段用户要在 SakiSU 管理器里操作，
+  # 看门狗每 25s 抢前台会打断授权（实测干扰）
+  kill_watchdog
   sync_log
 
   # -------------------------------------------------------------- 4) kallsyms
@@ -251,18 +302,41 @@ if [ "$PHASE" = "fire" ]; then
 fi  # PHASE=fire
 
 # ---------------------------------------------------------------- 7) 授权 + root
-say "等待 root 授权（需要时请在 SakiSU 管理器里点一次【允许】）"
+say "等待 root 授权。若 SakiSU 管理器首启为红色（vivo seccomp 杀探针导致未接管）："
+say "脚本会自动划掉重开一次；约 45s 仍无 root 还会自动重启 adbd（等价 ADB root 关-开）。"
 sh_ "monkey -p $MANAGER -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1
 ROOTED=0
+RELAUNCHED=0
+RESTARTED_ADBD=0
 for i in $(seq 1 40); do
   if sid | grep -q 'uid=0'; then ROOTED=2; break; fi                 # adbd 已是 root
   if sh_ "su -c id" | grep -q 'uid=0'; then ROOTED=1; break; fi     # su 可用
+  # ~18s 无果：自动划掉重开管理器（等价人工后台划掉，重开后探针重跑、握手成功）
+  if [ "$RELAUNCHED" = 0 ] && [ "$i" = 6 ]; then
+    say "管理器疑似未接管（红色）：自动划掉并重开一次"
+    sh_ "am force-stop $MANAGER" >/dev/null 2>&1
+    sleep 1
+    sh_ "monkey -p $MANAGER -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1
+    RELAUNCHED=1
+  fi
+  # ~48s 无果：自动重启 adbd（等价人工 ADB root 关-开；开关配置须已持久。
+  # adbd 重启会短暂断开本机 TCP 连接，靠 connect 重试恢复）
+  if [ "$RESTARTED_ADBD" = 0 ] && [ "$i" = 16 ]; then
+    say "adbd 仍非 root：自动重启 adbd（等价 ADB root 关-开）"
+    sh_ "setprop ctl.restart adbd" >/dev/null 2>&1
+    for j in $(seq 1 10); do
+      "$ADB" connect "$SERIAL" >/dev/null 2>&1
+      sid | grep -q 'uid=' && break
+      sleep 2
+    done
+    RESTARTED_ADBD=1
+  fi
   sleep 3
 done
 if [ "$ROOTED" = 0 ]; then
-  die "还没拿到 root。请在手机上打开 SakiSU 管理器，按提示点【允许】（首次还需在设置里开 ADB root），
-    然后重跑本脚本（KSU 已加载时会跳过发枪，直接接着做授权与修复）。
-    注意：不要在本脚本外单独跑 adb root —— 它会让 adbd 重启并丢掉 TCP 监听，手机内脚本就连不上自己了。"
+  die "还没拿到 root。自动划掉重开与 adbd 重启都试过后仍失败：请手动打开 SakiSU 管理器
+    （红色则再划掉重开一次），确认【ADB root】开关为开，然后重跑本脚本
+    （KSU 已加载时会跳过发枪，直接接着做授权与修复）。"
 fi
 ok "root 已就绪（$( [ "$ROOTED" = 1 ] && echo 'su' || echo 'adb root' )）"
 # 双通道自适应：正常走 su；adbd 本身已是 root 时（罕见）直接 shell，避免多余依赖

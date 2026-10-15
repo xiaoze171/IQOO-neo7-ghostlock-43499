@@ -10,3 +10,9 @@ pstore_*.txt
 # mimosa security-scanner local state (session history, reports)
 .mimosa/
 __pycache__/
+
+# on-device setup artifacts
+scripts/ondevice/glkey*
+
+# WorkBuddy workspace data (local memory/logs, not for the repo)
+.workbuddy/
